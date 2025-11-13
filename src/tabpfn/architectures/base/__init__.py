@@ -59,6 +59,7 @@ def get_architecture(
     *,
     n_out: int,
     cache_trainset_representation: bool,
+    n_regression_outputs: int = 1,
 ) -> PerFeatureTransformer:
     """Construct the base architecture following the given config.
 
@@ -72,6 +73,8 @@ def get_architecture(
         n_out: The number of output classes that the model should predict.
         cache_trainset_representation: If True, the model should be configured to
             cache the training data during inference to improve speed.
+        n_regression_outputs: The number of independent regression outputs (for multi-output).
+            Default is 1.
 
     Returns: the constructed architecture
     """
@@ -104,6 +107,7 @@ def get_architecture(
         cache_trainset_representation=cache_trainset_representation,
         use_encoder_compression_layer=False,
         n_out=n_out,
+        n_regression_outputs=n_regression_outputs,
         #
         # These are things that had default values from config.get() but were not
         # present in any config.

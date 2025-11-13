@@ -108,6 +108,7 @@ class PerFeatureTransformer(Architecture):
         encoder: nn.Module | None = None,
         y_encoder: nn.Module | None = None,
         n_out: int = 1,
+        n_regression_outputs: int = 1,
         activation: Literal["gelu", "relu"] = "gelu",
         min_num_layers_layer_dropout: int | None = None,
         zero_init: bool = True,
@@ -129,6 +130,11 @@ class PerFeatureTransformer(Architecture):
             y_encoder:
                 A nn.Module that takes in a batch of sequences of outputs and
                 returns something of the shape (seq_len, batch_size, ninp)
+            n_out:
+                Number of output dimensions per regression output (e.g., num_bars for regression)
+            n_regression_outputs:
+                Number of independent regression outputs (targets). For multi-output regression,
+                this creates separate decoder heads for each output. Default is 1.
             activation: An activation function, "gelu" or "relu"
             min_num_layers_layer_dropout:
                 If this is set, it enables to drop the last
@@ -241,15 +247,37 @@ class PerFeatureTransformer(Architecture):
             )
 
         self.n_out = n_out
-        self.decoder_dict = nn.ModuleDict(
-            {
-                "standard": nn.Sequential(
-                    nn.Linear(self.ninp, nhid),
-                    nn.GELU(),
-                    nn.Linear(nhid, n_out),
-                )
-            }
-        )
+        self.n_regression_outputs = n_regression_outputs
+
+        # For multi-output regression: create separate decoder heads
+        # Each head outputs n_out logits (e.g., num_bars for bar distribution)
+        if n_regression_outputs == 1:
+            # Single output: backward compatible
+            self.decoder_dict = nn.ModuleDict(
+                {
+                    "standard": nn.Sequential(
+                        nn.Linear(self.ninp, nhid),
+                        nn.GELU(),
+                        nn.Linear(nhid, n_out),
+                    )
+                }
+            )
+        else:
+            # Multi-output: create separate decoder heads
+            self.decoder_dict = nn.ModuleDict(
+                {
+                    f"output_{i}": nn.Sequential(
+                        nn.Linear(self.ninp, nhid),
+                        nn.GELU(),
+                        nn.Linear(nhid, n_out),
+                    )
+                    for i in range(n_regression_outputs)
+                }
+            )
+            # Also keep a "standard" key that combines all outputs for compatibility
+            self.decoder_dict["standard"] = nn.ModuleList([
+                self.decoder_dict[f"output_{i}"] for i in range(n_regression_outputs)
+            ])
 
         self.feature_positional_embedding = config.feature_positional_embedding
         if self.feature_positional_embedding == "learned":
@@ -598,13 +626,28 @@ class PerFeatureTransformer(Architecture):
 
         if only_return_standard_out:
             assert self.decoder_dict is not None
-            output_decoded = self.decoder_dict["standard"](test_encoder_out)
+            if self.n_regression_outputs == 1:
+                # Single output: standard behavior
+                output_decoded = self.decoder_dict["standard"](test_encoder_out)
+            else:
+                # Multi-output: stack outputs from all decoder heads
+                # Shape: (seq_len, n_outputs, n_out) where n_out is num_bars
+                outputs = []
+                for i in range(self.n_regression_outputs):
+                    outputs.append(self.decoder_dict[f"output_{i}"](test_encoder_out))
+                output_decoded = torch.stack(outputs, dim=1)
         else:
-            output_decoded = (
-                {k: v(test_encoder_out) for k, v in self.decoder_dict.items()}
-                if self.decoder_dict is not None
-                else {}
-            )
+            if self.decoder_dict is not None:
+                if self.n_regression_outputs == 1:
+                    # Single output: standard behavior
+                    output_decoded = {k: v(test_encoder_out) for k, v in self.decoder_dict.items()}
+                else:
+                    # Multi-output: apply each decoder head separately
+                    output_decoded = {}
+                    for i in range(self.n_regression_outputs):
+                        output_decoded[f"output_{i}"] = self.decoder_dict[f"output_{i}"](test_encoder_out)
+            else:
+                output_decoded = {}
 
             # out: s b e
             thinking_rows_offset = (

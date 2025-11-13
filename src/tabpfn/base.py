@@ -102,6 +102,7 @@ def initialize_tabpfn_model(
     | list[ClassifierModelSpecs],
     which: Literal["classifier", "regressor"],
     fit_mode: Literal["low_memory", "fit_preprocessors", "fit_with_cache"],
+    n_regression_outputs: int = 1,
 ) -> tuple[
     list[Architecture],
     list[ArchitectureConfig],
@@ -118,6 +119,7 @@ def initialize_tabpfn_model(
 
         which: Which TabPFN model to load.
         fit_mode: Determines caching behavior.
+        n_regression_outputs: Number of output targets for multi-output regression.
 
     Returns:
         a list of models,
@@ -195,6 +197,7 @@ def initialize_tabpfn_model(
                     which="classifier",
                     version=version.value,
                     download_if_not_exists=download_if_not_exists,
+                    n_regression_outputs=n_regression_outputs,
                 )
             )
             norm_criterion = None
@@ -208,6 +211,7 @@ def initialize_tabpfn_model(
                     which="regressor",
                     version=version.value,
                     download_if_not_exists=download_if_not_exists,
+                    n_regression_outputs=n_regression_outputs,
                 )
             )
             norm_criterion = bardist
@@ -523,11 +527,18 @@ def initialize_model_variables_helper(
         dtype, and rng is a NumPy random Generator for use during inference.
     """
     static_seed, rng = infer_random_state(calling_instance.random_state)
+
+    # Get n_regression_outputs for multi-output regression
+    n_regression_outputs = 1
+    if model_type == "regressor" and hasattr(calling_instance, 'n_outputs'):
+        n_regression_outputs = calling_instance.n_outputs
+
     models, architecture_configs, maybe_bardist, inference_config = (
         initialize_tabpfn_model(
             model_path=calling_instance.model_path,  # pyright: ignore[reportArgumentType]
             which=model_type,
             fit_mode=calling_instance.fit_mode,  # pyright: ignore[reportArgumentType]
+            n_regression_outputs=n_regression_outputs,
         )
     )
     calling_instance.models_ = models
