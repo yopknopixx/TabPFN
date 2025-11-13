@@ -113,8 +113,9 @@ predictions_quantiles = model.predict(X_test, output_type="quantiles")  # list o
 
 1. **Pretrained Model Weights**:
    - Current pretrained models are trained with single output head
-   - When `n_outputs > 1`, new decoder heads are created with **random initialization**
-   - For best results with multi-output, consider **fine-tuning** after initialization
+   - When `n_outputs > 1`, new decoder heads are created and **initialized by copying the pretrained weights** from the single-output head
+   - This provides much better initialization than random weights - all heads start with learned representations
+   - Fine-tuning will allow each head to specialize for its specific output target
 
 2. **Y-Encoder**:
    - Current implementation processes targets with existing single-target y_encoder
@@ -122,7 +123,8 @@ predictions_quantiles = model.predict(X_test, output_type="quantiles")  # list o
 
 3. **Model Loading**:
    - When loading pretrained models, weights are loaded for shared components (encoder, transformer layers)
-   - Additional decoder heads (when `n_outputs > 1`) are initialized randomly
+   - The pretrained decoder weights are automatically copied to all new decoder heads (output_0, output_1, etc.)
+   - Each head then has the same strong starting point and can be fine-tuned independently
 
 ## Testing
 
@@ -151,7 +153,7 @@ To fully utilize multi-output with pretrained models:
 
 - **Memory**: Multi-output uses more memory due to multiple decoder heads
 - **Speed**: Slightly slower due to processing multiple outputs, but benefits from shared encoder
-- **Quality**: Initial predictions may be less accurate until fine-tuned, as new heads are randomly initialized
+- **Quality**: Initial predictions benefit from pretrained weights copied to all heads, providing strong baseline performance even before fine-tuning
 
 ## Conclusion
 
