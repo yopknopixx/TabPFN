@@ -454,6 +454,7 @@ def load_model_criterion_config(
     version: Literal["v2", "v2.5"],
     which: Literal["classifier"],
     download_if_not_exists: bool,
+    n_regression_outputs: int = 1,
 ) -> tuple[
     list[Architecture],
     nn.BCEWithLogitsLoss | nn.CrossEntropyLoss,
@@ -471,6 +472,7 @@ def load_model_criterion_config(
     version: Literal["v2", "v2.5"],
     which: Literal["regressor"],
     download_if_not_exists: bool,
+    n_regression_outputs: int = 1,
 ) -> tuple[
     list[Architecture],
     FullSupportBarDistribution,
@@ -487,6 +489,7 @@ def load_model_criterion_config(
     which: Literal["regressor", "classifier"],
     version: Literal["v2", "v2.5"] = "v2",
     download_if_not_exists: bool,
+    n_regression_outputs: int = 1,
 ) -> tuple[
     list[Architecture],
     nn.BCEWithLogitsLoss | nn.CrossEntropyLoss | FullSupportBarDistribution,
@@ -558,6 +561,7 @@ def load_model_criterion_config(
         loaded_model, criterion, architecture_config, inference_config = load_model(
             path=path,
             cache_trainset_representation=cache_trainset_representation,
+            n_regression_outputs=n_regression_outputs,
         )
         if check_bar_distribution_criterion and not isinstance(
             criterion,
@@ -719,6 +723,7 @@ def load_model(
     *,
     path: Path,
     cache_trainset_representation: bool = True,
+    n_regression_outputs: int = 1,
 ) -> tuple[
     Architecture,
     nn.BCEWithLogitsLoss | nn.CrossEntropyLoss | FullSupportBarDistribution,
@@ -731,6 +736,7 @@ def load_model(
         path: Path to the checkpoint
         cache_trainset_representation: If True, the model will cache the
             trainset representation. Forwarded to get_architecture.
+        n_regression_outputs: Number of output targets for multi-output regression.
     """
     # Catch the `FutureWarning` that torch raises. This should be dealt with!
     # The warning is raised due to `torch.load`, which advises against ckpt
@@ -768,8 +774,9 @@ def load_model(
         model_config,
         n_out=get_n_out(model_config, loss_criterion),
         cache_trainset_representation=cache_trainset_representation,
+        n_regression_outputs=n_regression_outputs,
     )
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=False)  # strict=False allows loading with extra decoder heads
     model.eval()
 
     inference_config = _get_inference_config_from_checkpoint(checkpoint, loss_criterion)

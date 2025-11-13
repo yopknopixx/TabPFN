@@ -628,7 +628,35 @@ class TabPFNRegressor(RegressorMixin, BaseEstimator):
 
     def _initialize_model_variables(self) -> tuple[int, np.random.Generator]:
         """Initializes the model, returning byte_size and RNG object."""
-        return initialize_model_variables_helper(self, "regressor")
+        byte_size, rng = initialize_model_variables_helper(self, "regressor")
+
+        # If multi-output, copy pretrained decoder weights to all new heads
+        if hasattr(self, 'n_outputs') and self.n_outputs > 1:
+            self._copy_decoder_weights_to_all_heads()
+
+        return byte_size, rng
+
+    def _copy_decoder_weights_to_all_heads(self) -> None:
+        """Copy pretrained single-output decoder weights to all multi-output heads.
+
+        When using pretrained models with multi-output (n_outputs > 1), this copies
+        the learned weights from the pretrained single-output decoder to initialize
+        all new decoder heads. This provides much better initialization than random
+        weights.
+        """
+        for model in self.models_:
+            if hasattr(model, 'n_regression_outputs') and model.n_regression_outputs > 1:
+                if hasattr(model, 'decoder_dict') and 'output_0' in model.decoder_dict:
+                    # Copy weights from output_0 to all other output heads
+                    source_decoder = model.decoder_dict['output_0']
+                    for i in range(1, model.n_regression_outputs):
+                        target_decoder = model.decoder_dict[f'output_{i}']
+                        # Copy each layer's weights and biases
+                        for source_layer, target_layer in zip(source_decoder, target_decoder):
+                            if hasattr(source_layer, 'weight'):
+                                target_layer.weight.data.copy_(source_layer.weight.data)
+                            if hasattr(source_layer, 'bias') and source_layer.bias is not None:
+                                target_layer.bias.data.copy_(source_layer.bias.data)
 
     def _initialize_dataset_preprocessing(
         self, X: XType, y: YType, rng: np.random.Generator
