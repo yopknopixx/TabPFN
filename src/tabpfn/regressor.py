@@ -174,17 +174,18 @@ class TabPFNRegressor(RegressorMixin, BaseEstimator):
     work best for the model.
     """
 
-    n_outputs_: Literal[1]  # We only support single output
-    """The number of outputs the model supports. Only 1 for now"""
+    n_outputs_: int
+    """The number of outputs the model supports. 1 for single-output, >1 for multi-output regression"""
 
-    znorm_space_bardist_: FullSupportBarDistribution
-    """The bar distribution of the target variable, used by the model.
+    znorm_space_bardist_: FullSupportBarDistribution | list[FullSupportBarDistribution]
+    """The bar distribution of the target variable(s), used by the model.
     This is the bar distribution in the normalized target space.
+    For multi-output: list of bar distributions, one per output.
     """
 
-    raw_space_bardist_: FullSupportBarDistribution
+    raw_space_bardist_: FullSupportBarDistribution | list[FullSupportBarDistribution]
     """The bar distribution in the raw target space, used for computing the
-    predictions."""
+    predictions. For multi-output: list of bar distributions, one per output."""
 
     use_autocast_: bool
     """Whether torch's autocast should be used."""
@@ -202,6 +203,7 @@ class TabPFNRegressor(RegressorMixin, BaseEstimator):
         self,
         *,
         n_estimators: int = 8,
+        n_outputs: int = 1,
         categorical_features_indices: Sequence[int] | None = None,
         softmax_temperature: float = 0.9,
         average_before_softmax: bool = False,
@@ -240,6 +242,14 @@ class TabPFNRegressor(RegressorMixin, BaseEstimator):
                 predictions of `n_estimators`-many forward passes of TabPFN.
                 Each forward pass has (slightly) different input data. Think of this
                 as an ensemble of `n_estimators`-many "prompts" of the input data.
+
+            n_outputs:
+                The number of independent output targets for multi-output regression.
+                Default is 1 (single-output). For multi-output regression with n > 1,
+                the model will create separate decoder heads for each output target.
+                This requires that fit() receives y with shape (n_samples, n_outputs).
+                Note: Multi-output support with separate heads may require fine-tuning
+                when using pretrained models.
 
             categorical_features_indices:
                 The indices of the columns that are suggested to be treated as
@@ -439,6 +449,7 @@ class TabPFNRegressor(RegressorMixin, BaseEstimator):
         """
         super().__init__()
         self.n_estimators = n_estimators
+        self.n_outputs = n_outputs
         self.categorical_features_indices = categorical_features_indices
         self.softmax_temperature = softmax_temperature
         self.average_before_softmax = average_before_softmax
@@ -652,6 +663,13 @@ class TabPFNRegressor(RegressorMixin, BaseEstimator):
             self.feature_names_in_ = feature_names_in
         self.n_features_in_ = n_features_in
 
+        # Determine number of outputs - reshape y if needed
+        if y.ndim == 1:
+            y = y.reshape(-1, 1)
+            self.n_outputs_ = 1
+        else:
+            self.n_outputs_ = y.shape[1]
+
         self.inferred_categorical_indices_ = infer_categorical_features(
             X=X,
             provided=self.categorical_features_indices,
@@ -804,34 +822,81 @@ class TabPFNRegressor(RegressorMixin, BaseEstimator):
 
         assert len(ensemble_configs) == self.n_estimators
 
-        self.is_constant_target_ = np.unique(y).size == 1
-        self.constant_value_ = y[0] if self.is_constant_target_ else None
+        # Check for constant targets - handle per output
+        if self.n_outputs_ == 1:
+            self.is_constant_target_ = np.unique(y[:, 0]).size == 1
+            self.constant_value_ = y[0, 0] if self.is_constant_target_ else None
+        else:
+            # For multi-output, check if ALL outputs are constant
+            self.is_constant_target_ = all(np.unique(y[:, i]).size == 1 for i in range(self.n_outputs_))
+            self.constant_value_ = y[0, :] if self.is_constant_target_ else None
 
         if self.is_constant_target_:
             # Use relative epsilon, s.t. it works for small and large constant values
-            border_adjustment = max(
-                abs(self.constant_value_ * REGRESSION_CONSTANT_TARGET_BORDER_EPSILON),
-                REGRESSION_CONSTANT_TARGET_BORDER_EPSILON,
-            )
-
-            self.znorm_space_bardist_ = FullSupportBarDistribution(
-                borders=torch.tensor(
-                    [
-                        self.constant_value_ - border_adjustment,
-                        self.constant_value_ + border_adjustment,
-                    ]
+            if self.n_outputs_ == 1:
+                border_adjustment = max(
+                    abs(self.constant_value_ * REGRESSION_CONSTANT_TARGET_BORDER_EPSILON),
+                    REGRESSION_CONSTANT_TARGET_BORDER_EPSILON,
                 )
-            )
+                self.znorm_space_bardist_ = FullSupportBarDistribution(
+                    borders=torch.tensor(
+                        [
+                            self.constant_value_ - border_adjustment,
+                            self.constant_value_ + border_adjustment,
+                        ]
+                    )
+                )
+            else:
+                # Multi-output: create bar distribution per output
+                self.znorm_space_bardist_ = []
+                for i in range(self.n_outputs_):
+                    border_adjustment = max(
+                        abs(self.constant_value_[i] * REGRESSION_CONSTANT_TARGET_BORDER_EPSILON),
+                        REGRESSION_CONSTANT_TARGET_BORDER_EPSILON,
+                    )
+                    self.znorm_space_bardist_.append(
+                        FullSupportBarDistribution(
+                            borders=torch.tensor(
+                                [
+                                    self.constant_value_[i] - border_adjustment,
+                                    self.constant_value_[i] + border_adjustment,
+                                ]
+                            )
+                        )
+                    )
             # No need to create an inference engine for a constant prediction
             return self
 
-        mean, std = np.mean(y), np.std(y)
-        self.y_train_std_ = std.item() + 1e-20
-        self.y_train_mean_ = mean.item()
-        y = (y - self.y_train_mean_) / self.y_train_std_
-        self.raw_space_bardist_ = FullSupportBarDistribution(
-            self.znorm_space_bardist_.borders * self.y_train_std_ + self.y_train_mean_,
-        ).float()
+        # Per-output normalization
+        if self.n_outputs_ == 1:
+            # Single output: backward compatible
+            mean, std = np.mean(y[:, 0]), np.std(y[:, 0])
+            self.y_train_std_ = std.item() + 1e-20
+            self.y_train_mean_ = mean.item()
+            y = (y - self.y_train_mean_) / self.y_train_std_
+            self.raw_space_bardist_ = FullSupportBarDistribution(
+                self.znorm_space_bardist_.borders * self.y_train_std_ + self.y_train_mean_,
+            ).float()
+        else:
+            # Multi-output: per-output mean and std
+            means = np.mean(y, axis=0)  # shape: (n_outputs_,)
+            stds = np.std(y, axis=0)  # shape: (n_outputs_,)
+            self.y_train_std_ = stds + 1e-20
+            self.y_train_mean_ = means
+            # Normalize each output separately
+            y = (y - self.y_train_mean_) / self.y_train_std_
+            # Create per-output bar distributions
+            self.raw_space_bardist_ = []
+            for i in range(self.n_outputs_):
+                if isinstance(self.znorm_space_bardist_, list):
+                    borders = self.znorm_space_bardist_[i].borders
+                else:
+                    borders = self.znorm_space_bardist_.borders
+                self.raw_space_bardist_.append(
+                    FullSupportBarDistribution(
+                        borders * self.y_train_std_[i] + self.y_train_mean_[i],
+                    ).float()
+                )
 
         # Create the inference engine
         self.executor_ = create_inference_engine(
@@ -958,24 +1023,70 @@ class TabPFNRegressor(RegressorMixin, BaseEstimator):
         ) = self.forward(X, use_inference_mode=True)
 
         # --- Translate probs, average, get final logits ---
-        transformed_logits = [
-            translate_probs_across_borders(
-                logits,
-                frm=torch.as_tensor(borders_t, device=logits.device),
-                to=self.znorm_space_bardist_.borders.to(logits.device),
-            )
-            for logits, borders_t in zip(outputs, borders)
-        ]
-        stacked_logits = torch.stack(transformed_logits, dim=0)
-        if self.average_before_softmax:
-            logits = stacked_logits.log().mean(dim=0).softmax(dim=-1)
-        else:
-            logits = stacked_logits.mean(dim=0)
+        if self.n_outputs_ == 1:
+            # Single output: original behavior
+            transformed_logits = [
+                translate_probs_across_borders(
+                    logits,
+                    frm=torch.as_tensor(borders_t, device=logits.device),
+                    to=self.znorm_space_bardist_.borders.to(logits.device),
+                )
+                for logits, borders_t in zip(outputs, borders)
+            ]
+            stacked_logits = torch.stack(transformed_logits, dim=0)
+            if self.average_before_softmax:
+                logits = stacked_logits.log().mean(dim=0).softmax(dim=-1)
+            else:
+                logits = stacked_logits.mean(dim=0)
 
-        # Post-process the logits
-        logits = logits.log()
-        if logits.dtype == torch.float16:
-            logits = logits.float()
+            # Post-process the logits
+            logits = logits.log()
+            if logits.dtype == torch.float16:
+                logits = logits.float()
+        else:
+            # Multi-output: process each output separately
+            # outputs: list of tensors with shape (n_samples, n_outputs, num_bars)
+            # borders: list of lists, each with n_outputs border arrays
+            all_output_logits = []
+            for output_idx in range(self.n_outputs_):
+                output_specific_logits = []
+                for logits_all, borders_all in zip(outputs, borders):
+                    # Extract logits for this specific output
+                    if logits_all.ndim == 3:  # (n_samples, n_outputs, num_bars)
+                        logits_single = logits_all[:, output_idx, :]  # (n_samples, num_bars)
+                    else:
+                        logits_single = logits_all  # Fallback for single output
+
+                    # Get borders for this output
+                    if isinstance(borders_all, list):
+                        borders_t = borders_all[output_idx]
+                    else:
+                        borders_t = borders_all
+
+                    # Translate borders
+                    target_borders = self.znorm_space_bardist_[output_idx].borders if isinstance(self.znorm_space_bardist_, list) else self.znorm_space_bardist_.borders
+                    transformed = translate_probs_across_borders(
+                        logits_single,
+                        frm=torch.as_tensor(borders_t, device=logits_single.device),
+                        to=target_borders.to(logits_single.device),
+                    )
+                    output_specific_logits.append(transformed)
+
+                # Stack and average for this output
+                stacked = torch.stack(output_specific_logits, dim=0)
+                if self.average_before_softmax:
+                    avg_logits = stacked.log().mean(dim=0).softmax(dim=-1)
+                else:
+                    avg_logits = stacked.mean(dim=0)
+
+                avg_logits = avg_logits.log()
+                if avg_logits.dtype == torch.float16:
+                    avg_logits = avg_logits.float()
+
+                all_output_logits.append(avg_logits)
+
+            # Stack all outputs: shape (n_samples, n_outputs, num_bars)
+            logits = torch.stack(all_output_logits, dim=1)
 
         # Determine and return intended output type
         logit_to_output = partial(
@@ -1078,9 +1189,16 @@ class TabPFNRegressor(RegressorMixin, BaseEstimator):
 
         check_is_fitted(self)
 
-        std_borders = self.znorm_space_bardist_.borders.cpu().numpy()
+        # Handle borders for single or multi-output
+        if isinstance(self.znorm_space_bardist_, list):
+            # Multi-output: list of bar distributions
+            std_borders = [bardist.borders.cpu().numpy() for bardist in self.znorm_space_bardist_]
+        else:
+            # Single output
+            std_borders = self.znorm_space_bardist_.borders.cpu().numpy()
+
         outputs: list[torch.Tensor] = []
-        borders: list[np.ndarray] = []
+        borders: list[np.ndarray | list[np.ndarray]] = []
 
         # Iterate over estimators
         for output, config in self.executor_.iter_outputs(
@@ -1100,39 +1218,63 @@ class TabPFNRegressor(RegressorMixin, BaseEstimator):
                 config_for_ensemble = single_config
 
             if isinstance(config_for_ensemble, RegressorEnsembleConfig):
-                borders_t: np.ndarray
-                logit_cancel_mask: np.ndarray | None
-                descending_borders: bool
+                # Handle borders for single or multi-output
+                if isinstance(std_borders, list):
+                    # Multi-output: process each output's borders separately
+                    borders_t_list = []
+                    for i, borders_single in enumerate(std_borders):
+                        if config_for_ensemble.target_transform is None:
+                            borders_t_single = borders_single.copy()
+                            logit_cancel_mask = None
+                            descending_borders = False
+                        else:
+                            logit_cancel_mask, descending_borders, borders_t_single = (
+                                transform_borders_one(
+                                    borders_single,
+                                    target_transform=config_for_ensemble.target_transform,
+                                    repair_nan_borders_after_transform=self.inference_config_.FIX_NAN_BORDERS_AFTER_TARGET_TRANSFORM,
+                                )
+                            )
+                            if descending_borders:
+                                borders_t_single = borders_t_single.flip(-1)  # type: ignore
 
-                # TODO(eddiebergman): Maybe this could be parallelized or done in fit
-                # but I somehow doubt it takes much time to be worth it.
-                # One reason to make it worth it is if you want fast predictions, i.e.
-                # don't re-do this each time.
-                # However it gets a bit more difficult as you need to line up the
-                # outputs from `iter_outputs` above (which may be in arbitrary order),
-                # along with the specific config the output belongs to. This is because
-                # the transformation done to the borders for a given output is dependant
-                # upon the target_transform of the config.
-                if config_for_ensemble.target_transform is None:
-                    borders_t = std_borders.copy()
-                    logit_cancel_mask = None
-                    descending_borders = False
+                        borders_t_list.append(borders_t_single)
+
+                        if logit_cancel_mask is not None:
+                            output = output.clone()  # noqa: PLW2901
+                            # For multi-output: apply mask to specific output dimension
+                            if output.ndim == 3:  # (n_samples, n_outputs, num_bars)
+                                output[:, i, logit_cancel_mask] = float("-inf")
+                            else:
+                                output[..., logit_cancel_mask] = float("-inf")
+
+                    borders.append(borders_t_list)
                 else:
-                    logit_cancel_mask, descending_borders, borders_t = (
-                        transform_borders_one(
-                            std_borders,
-                            target_transform=config_for_ensemble.target_transform,
-                            repair_nan_borders_after_transform=self.inference_config_.FIX_NAN_BORDERS_AFTER_TARGET_TRANSFORM,
+                    # Single output: original behavior
+                    borders_t: np.ndarray
+                    logit_cancel_mask: np.ndarray | None
+                    descending_borders: bool
+
+                    if config_for_ensemble.target_transform is None:
+                        borders_t = std_borders.copy()
+                        logit_cancel_mask = None
+                        descending_borders = False
+                    else:
+                        logit_cancel_mask, descending_borders, borders_t = (
+                            transform_borders_one(
+                                std_borders,
+                                target_transform=config_for_ensemble.target_transform,
+                                repair_nan_borders_after_transform=self.inference_config_.FIX_NAN_BORDERS_AFTER_TARGET_TRANSFORM,
+                            )
                         )
-                    )
-                    if descending_borders:
-                        borders_t = borders_t.flip(-1)  # type: ignore
+                        if descending_borders:
+                            borders_t = borders_t.flip(-1)  # type: ignore
 
-                borders.append(borders_t)
+                    borders.append(borders_t)
 
-                if logit_cancel_mask is not None:
-                    output = output.clone()  # noqa: PLW2901
-                    output[..., logit_cancel_mask] = float("-inf")
+                    if logit_cancel_mask is not None:
+                        output = output.clone()  # noqa: PLW2901
+                        output[..., logit_cancel_mask] = float("-inf")
 
             else:
                 raise ValueError(
@@ -1155,26 +1297,50 @@ class TabPFNRegressor(RegressorMixin, BaseEstimator):
         self, n_samples: int, output_type: OutputType, quantiles: list[float]
     ) -> RegressionResultType:
         """Handles prediction when the training target `y` was a constant value."""
-        constant_prediction = np.full(n_samples, self.constant_value_)
-        if output_type in _OUTPUT_TYPES_BASIC:
-            return constant_prediction
-        if output_type == "quantiles":
-            return [np.copy(constant_prediction) for _ in quantiles]
+        if self.n_outputs_ == 1:
+            # Single output: original behavior
+            constant_prediction = np.full(n_samples, self.constant_value_)
+            if output_type in _OUTPUT_TYPES_BASIC:
+                return constant_prediction
+            if output_type == "quantiles":
+                return [np.copy(constant_prediction) for _ in quantiles]
 
-        # Handle "main" and "full"
-        main_outputs = MainOutputDict(
-            mean=constant_prediction,
-            median=np.copy(constant_prediction),
-            mode=np.copy(constant_prediction),
-            quantiles=[np.copy(constant_prediction) for _ in quantiles],
-        )
-        if output_type == "full":
-            return FullOutputDict(
-                **main_outputs,
-                criterion=self.znorm_space_bardist_,
-                logits=torch.zeros((n_samples, 1)),
+            # Handle "main" and "full"
+            main_outputs = MainOutputDict(
+                mean=constant_prediction,
+                median=np.copy(constant_prediction),
+                mode=np.copy(constant_prediction),
+                quantiles=[np.copy(constant_prediction) for _ in quantiles],
             )
-        return main_outputs
+            if output_type == "full":
+                return FullOutputDict(
+                    **main_outputs,
+                    criterion=self.znorm_space_bardist_,
+                    logits=torch.zeros((n_samples, 1)),
+                )
+            return main_outputs
+        else:
+            # Multi-output: return predictions for all outputs
+            constant_prediction = np.tile(self.constant_value_, (n_samples, 1))  # Shape: (n_samples, n_outputs)
+            if output_type in _OUTPUT_TYPES_BASIC:
+                return constant_prediction
+            if output_type == "quantiles":
+                return [np.copy(constant_prediction) for _ in quantiles]
+
+            # Handle "main" and "full"
+            main_outputs = MainOutputDict(
+                mean=constant_prediction,
+                median=np.copy(constant_prediction),
+                mode=np.copy(constant_prediction),
+                quantiles=[np.copy(constant_prediction) for _ in quantiles],
+            )
+            if output_type == "full":
+                return FullOutputDict(
+                    **main_outputs,
+                    criterion=self.znorm_space_bardist_,
+                    logits=torch.zeros((n_samples, self.n_outputs_, 1)),
+                )
+            return main_outputs
 
     def get_embeddings(
         self,
@@ -1219,10 +1385,47 @@ def _logits_to_output(
     *,
     output_type: str,
     logits: torch.Tensor,
-    criterion: FullSupportBarDistribution,
+    criterion: FullSupportBarDistribution | list[FullSupportBarDistribution],
     quantiles: list[float],
 ) -> np.ndarray | list[np.ndarray]:
-    """Converts raw model logits to the desired prediction format."""
+    """Converts raw model logits to the desired prediction format.
+
+    For single-output: logits shape is (n_samples, num_bars)
+    For multi-output: logits shape is (n_samples, n_outputs, num_bars)
+    """
+    # Handle multi-output case
+    if isinstance(criterion, list):
+        # Multi-output: process each output separately
+        n_outputs = len(criterion)
+        assert logits.ndim == 3, f"Expected 3D logits for multi-output, got shape {logits.shape}"
+        assert logits.shape[1] == n_outputs, f"Logits shape[1]={logits.shape[1]} != n_outputs={n_outputs}"
+
+        if output_type == "quantiles":
+            # Return list of arrays, one per quantile
+            # Each array has shape (n_samples, n_outputs)
+            results = []
+            for q in quantiles:
+                output_q = []
+                for i in range(n_outputs):
+                    output_q.append(criterion[i].icdf(logits[:, i, :], q).cpu().detach().numpy())
+                results.append(np.stack(output_q, axis=1))
+            return results
+
+        # For mean, median, mode: return array of shape (n_samples, n_outputs)
+        outputs = []
+        for i in range(n_outputs):
+            if output_type == "mean":
+                out = criterion[i].mean(logits[:, i, :])
+            elif output_type == "median":
+                out = criterion[i].median(logits[:, i, :])
+            elif output_type == "mode":
+                out = criterion[i].mode(logits[:, i, :])
+            else:
+                raise ValueError(f"Invalid output type: {output_type}")
+            outputs.append(out.cpu().detach().numpy())
+        return np.stack(outputs, axis=1)
+
+    # Single-output case (backward compatible)
     if output_type == "quantiles":
         return [criterion.icdf(logits, q).cpu().detach().numpy() for q in quantiles]
 
